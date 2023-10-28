@@ -1,46 +1,99 @@
 use anyhow::{bail, Context, Result};
+use futures::StreamExt;
 use tokio::{
     fs,
     net::{UnixListener, UnixStream},
+    sync::mpsc,
 };
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::info;
 
-use crate::types::Config;
+use crate::{
+    server::{ClientId, GlobalState, NewConnection, Task},
+    types::{BootstrapMessage, Config},
+};
 
 pub async fn run() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     info!("Running the daemon");
-    let config = Config::default();
 
-    let parent = config.socket_path.parent().unwrap();
+    // Create the global state. This loads the default configuration.
+    let mut state = GlobalState::default();
+
+    let parent = state.config.socket_path.parent().unwrap();
     let _ = fs::create_dir_all(parent).await;
 
     // Test to see if another instance of the daemon is running by making a
     // connection.
     {
-        let socket = UnixStream::connect(&config.socket_path).await;
+        let socket = UnixStream::connect(&state.config.socket_path).await;
         if socket.is_ok() {
             bail!("Daemon already running.");
         }
     }
 
     // Make sure the file is removed.
-    let _ = fs::remove_file(&config.socket_path).await;
+    let _ = fs::remove_file(&state.config.socket_path).await;
 
-    let listener =
-        UnixListener::bind(&config.socket_path).context("Failed to listen to the unix socket.")?;
-    info!("Listening on {:?}", config.socket_path);
+    let listener = UnixListener::bind(&state.config.socket_path)
+        .context("Failed to listen to the unix socket.")?;
+    info!("Listening on {:?}", state.config.socket_path);
 
-    while let Ok((_stream, addr)) = listener.accept().await {
-        info!("Accepted client {addr:?}");
-        let _bin = config.rust_analyzer_bin.clone();
-        tokio::spawn(async move {
-            // match handle_connection(session_map, bin, stream).await {
-            //     Ok(_) => info!("Client detached"),
-            //     Err(e) => error!("Connection failed: {e:?}"),
-            // }
-        });
+    let (tx, mut rx) = mpsc::channel::<Task>(2048);
+
+    // This task is responsible for listening for new connections.
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                handle_client(tx.clone(), stream).await;
+            });
+        }
+    });
+
+    while let Some(task) = rx.recv().await {
+        let _ = state.handle_task(task).await;
+    }
+
+    Ok(())
+}
+
+async fn handle_client(tx: mpsc::Sender<Task>, stream: UnixStream) -> Result<()> {
+    let (reader, writer) = stream.into_split();
+    let mut reader = FramedRead::new(reader, LengthDelimitedCodec::new());
+    let mut writer = FramedWrite::new(writer, LengthDelimitedCodec::new());
+
+    let bytes = reader
+        .next()
+        .await
+        .context("Could not get the initial message.")??;
+    let bootstrap: BootstrapMessage =
+        serde_json::from_slice(&bytes).context("Invalid bootstrap message.")?;
+
+    // Should be an 'initialize' request.
+    let bytes = reader
+        .next()
+        .await
+        .context("Could not get the first request.")??;
+    let request: lsp_server::Request =
+        serde_json::from_slice(&bytes).context("Invalid LSP request.")?;
+
+    let id = ClientId::new();
+
+    tx.send(Task::NewConnection(NewConnection {
+        id,
+        writer,
+        bootstrap,
+        request,
+    }))
+    .await;
+
+    while let Some(next) = reader.next().await {
+        let bytes = next.context("Failed to read length delimited message.")?;
+        let message: lsp_server::Message =
+            serde_json::from_slice(&bytes).context("Invalid LSP message.")?;
+        tx.send(Task::ClientMessage(id, message));
     }
 
     Ok(())
