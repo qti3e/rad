@@ -41,7 +41,7 @@ pub async fn run() -> Result<()> {
                 .context("Failed to write.")?;
 
             if is_exit {
-                break;
+                std::process::exit(0);
             }
         }
 

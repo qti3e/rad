@@ -6,11 +6,11 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
-use tracing::info;
+use tracing::{error, info, trace};
 
 use crate::{
     server::{ClientId, GlobalState, NewConnection, Task},
-    types::{BootstrapMessage, Config},
+    types::BootstrapMessage,
 };
 
 pub async fn run() -> Result<()> {
@@ -41,28 +41,35 @@ pub async fn run() -> Result<()> {
     info!("Listening on {:?}", state.config.socket_path);
 
     let (tx, mut rx) = mpsc::channel::<Task>(2048);
+    state.set_sender(tx.clone());
 
     // This task is responsible for listening for new connections.
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let tx = tx.clone();
             tokio::spawn(async move {
-                handle_client(tx.clone(), stream).await;
+                let id = ClientId::new();
+                if let Err(e) = handle_client(id, tx.clone(), stream).await {
+                    error!("Client dropped with error: {e}");
+                }
+                let _ = tx.send(Task::ClientDropped(id)).await;
             });
         }
     });
 
     while let Some(task) = rx.recv().await {
-        let _ = state.handle_task(task).await;
+        if let Err(e) = state.handle_task(task).await {
+            error!("Error handling task: {e}")
+        }
     }
 
     Ok(())
 }
 
-async fn handle_client(tx: mpsc::Sender<Task>, stream: UnixStream) -> Result<()> {
+async fn handle_client(id: ClientId, tx: mpsc::Sender<Task>, stream: UnixStream) -> Result<()> {
     let (reader, writer) = stream.into_split();
     let mut reader = FramedRead::new(reader, LengthDelimitedCodec::new());
-    let mut writer = FramedWrite::new(writer, LengthDelimitedCodec::new());
+    let writer = FramedWrite::new(writer, LengthDelimitedCodec::new());
 
     let bytes = reader
         .next()
@@ -79,21 +86,27 @@ async fn handle_client(tx: mpsc::Sender<Task>, stream: UnixStream) -> Result<()>
     let request: lsp_server::Request =
         serde_json::from_slice(&bytes).context("Invalid LSP request.")?;
 
-    let id = ClientId::new();
-
     tx.send(Task::NewConnection(NewConnection {
         id,
         writer,
         bootstrap,
         request,
     }))
-    .await;
+    .await
+    .context("Failed to send task.")?;
 
     while let Some(next) = reader.next().await {
         let bytes = next.context("Failed to read length delimited message.")?;
         let message: lsp_server::Message =
             serde_json::from_slice(&bytes).context("Invalid LSP message.")?;
-        tx.send(Task::ClientMessage(id, message));
+
+        if matches!(&message, lsp_server::Message::Request(req) if req.method == "shutdown") {
+            break;
+        }
+
+        tx.send(Task::ClientMessage(id, message))
+            .await
+            .context("Failed to send task")?;
     }
 
     Ok(())

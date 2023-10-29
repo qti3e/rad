@@ -121,6 +121,3 @@ pub fn get_id(message: &Message) -> Option<&RequestId> {
         Message::Notification(_) => None,
     }
 }
-
-#[test]
-fn x() {}

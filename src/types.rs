@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use triomphe::Arc;
 
-use crate::utils::find_project_root;
-
 /// The configuration values.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -54,43 +52,6 @@ impl Default for BootstrapMessage {
         let args = env::args().skip(1).collect();
         let envs = env::vars().collect();
         Self { cwd, args, envs }
-    }
-}
-
-impl BootstrapMessage {
-    /// Given the bootstrap message from a client, build the server identifier and the command that
-    /// must be used to spawn the server.
-    pub fn parse(self, default_ra: &str) -> Result<(SessionKey, Command)> {
-        let workspace = find_project_root(&self.cwd)?;
-
-        // Get the rust analyzer binary from the env variables that are set in the child
-        // or default it to the one we have.
-        let bin = self
-            .envs
-            .get("RAD_RA")
-            .map(|s| s.as_str())
-            .unwrap_or(default_ra)
-            .to_string()
-            .to_string();
-
-        // Create the command by setting the binary name and the environment variables and
-        // the cwd.
-        let mut cmd = Command::new(&bin);
-        cmd.args(self.args.iter());
-        cmd.env_clear();
-        cmd.envs(self.envs);
-        cmd.current_dir(self.cwd); // TODO: Maybe `project_root`?
-
-        Ok((
-            SessionKey {
-                data: Arc::new(SessionKeyData {
-                    bin,
-                    args: self.args,
-                    workspace,
-                }),
-            },
-            cmd,
-        ))
     }
 }
 
