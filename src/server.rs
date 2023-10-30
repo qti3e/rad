@@ -794,6 +794,15 @@ impl GlobalState {
 
     async fn drop_server(&mut self, id: ServerId) {
         let mut server = self.server.remove(&id).expect("The server to exists.");
+
+        let descriptor = self
+            .server_descriptors
+            .iter()
+            .find_map(|(descriptor, sid)| (*sid == id).then(|| descriptor.clone()))
+            .unwrap();
+
+        self.server_descriptors.remove(&descriptor);
+
         let clients = self
             .client
             .iter()
