@@ -53,6 +53,12 @@ pub async fn run() -> Result<()> {
     while let Some(Ok(message)) = socket_reader.next().await {
         let message: lsp_server::Message =
             serde_json::from_slice(&message).expect("Invalid message");
+
+        // `$/exit` is the notification we use from the server side to force an exit.
+        if matches!(&message, lsp_server::Message::Notification(not) if not.method == "$/exit") {
+            std::process::exit(-1);
+        }
+
         message.write(&mut stdout)?;
     }
 

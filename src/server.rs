@@ -3,9 +3,10 @@
 //! this project.
 
 // TODO:
-// Document management : can be improved.
+// Document management : Can be improved.
 // Server garbage collection
 // Window progress bar
+// Better logs (Terminal UI)
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::BytesMut;
@@ -200,7 +201,7 @@ impl GlobalState {
             Task::ServerMessage(id, lsp_server::Message::Notification(not)) => {
                 self.handle_server_notification(id, not).await
             }
-            Task::ClientDropped(id) => self.handle_client_drop(id).await,
+            Task::ClientDropped(id) => self.drop_client(id).await,
             Task::ServerShutdown(id) => self.handle_server_drop(id).await,
         }
     }
@@ -251,7 +252,6 @@ impl GlobalState {
             // The following code up the return statement doesn't have any early exits to
             // perform the insertion.
             self.client.insert(client_id, client_state);
-            server_state.connections.push(client_id);
 
             // Send the initialize response to the client if it does exist. There is a small
             // possibility that the result might not exists if we have a second connection that
@@ -354,6 +354,7 @@ impl GlobalState {
             .request_id_map
             .remove(&res.id)
             .context("Request id not found.")?;
+        info!("Client response {} (org={})", res.id, original_id);
         res.id = original_id;
 
         // Check to see if the server is still interested in hearing back about this response.
@@ -398,7 +399,7 @@ impl GlobalState {
         let result = self.handle_client_notification_inner(id, not).await;
 
         if result.is_err() {
-            let _ = self.handle_client_drop(id).await;
+            let _ = self.drop_client(id).await;
         }
 
         result
@@ -534,13 +535,19 @@ impl GlobalState {
             let mut params: CancelParams = serde_json::from_value(not.params)
                 .context("Failed to parse client notification")?;
 
-            let request_id = server
-                .get_server_request_id_from_client_request_id(id, params.id)
-                .context("Cancellation request failed: Couldn't find the request id.")?
-                .clone();
+            let request_id = if let Some(request_id) =
+                server.get_server_request_id_from_client_request_id(id, &params.id)
+            {
+                request_id.clone()
+            } else {
+                error!(
+                    "Cancellation request ignored: Couldn't find the request id ({})",
+                    params.id
+                );
+                return Ok(());
+            };
 
             params.id = request_id;
-
             not.params = serde_json::to_value(params).unwrap();
         }
 
@@ -597,8 +604,6 @@ impl GlobalState {
         id: ServerId,
         mut res: lsp_server::Response,
     ) -> Result<()> {
-        info!("Server response");
-
         let server = self.server.get_mut(&id).context("Server not found.")?;
 
         // If 'initialize_result' is none, we are expecting it as the first response the server
@@ -659,6 +664,8 @@ impl GlobalState {
             .remove(&res.id)
             .context("Could not find request.")?;
 
+        info!("Server response (id={})", org_id);
+
         // Client might have been disconnected.
         let client = self
             .client
@@ -700,13 +707,36 @@ impl GlobalState {
         Ok(())
     }
 
-    pub async fn handle_client_drop(&mut self, id: ClientId) -> Result<()> {
-        info!("Client dropping");
+    pub async fn drop_client(&mut self, id: ClientId) -> Result<()> {
+        info!("Dropping client {id:?}");
 
-        let client = self.client.remove(&id).context("Client not found.")?;
+        let mut client = self.client.remove(&id).context("Client not found.")?;
+
+        // This should close the IO for the client.
+        client
+            .write_message(&lsp_server::Notification {
+                method: "$/exit".to_string(),
+                params: serde_json::Value::Null,
+            })
+            .await;
+
+        // This can actually be None when we're dropping the server itself. Which can
+        // happen when the server process exits.
         let server_id = client.server_id;
-        let server = self.server.get_mut(&server_id).unwrap();
+        let server = self
+            .server
+            .get_mut(&server_id)
+            .context("Server not found.")?;
         let maybe_index = server.connections.iter().position(|v| *v == id);
+
+        // This can be none when the client gets disconnected before it sends the 'initialized'
+        // notification.
+        let switch_primary = if let Some(index) = maybe_index {
+            server.connections.remove(index);
+            index == 0 && !server.connections.is_empty()
+        } else {
+            false
+        };
 
         let docs_to_close = server
             .document
@@ -733,17 +763,11 @@ impl GlobalState {
                 .await;
         }
 
-        // This can be none when the client gets disconnected before it sends the 'initialized'
-        // notification.
-        if let Some(index) = maybe_index {
-            server.connections.remove(index);
-
-            if index == 0 && !server.connections.is_empty() {
-                // The index is zero which means this is the oldest client that was connected and
-                // now that we have removed it a new client is taking the role of the primary so
-                // we have to make the switch.
-                self.new_primary(server_id).await;
-            }
+        if switch_primary {
+            // The index is zero which means this is the oldest client that was connected and
+            // now that we have removed it a new client is taking the role of the primary so
+            // we have to make the switch.
+            self.new_primary(server_id).await;
         }
 
         Ok(())
@@ -766,7 +790,7 @@ impl GlobalState {
             .collect::<Vec<_>>();
 
         for cid in clients {
-            self.client.remove(&cid);
+            self.drop_client(cid).await;
         }
 
         server.kill_sender.send(server.stdin);
@@ -816,11 +840,11 @@ impl ServerState {
     pub fn get_server_request_id_from_client_request_id(
         &self,
         client: ClientId,
-        id: lsp_server::RequestId,
+        id: &lsp_server::RequestId,
     ) -> Option<&lsp_server::RequestId> {
         self.request_id_map
             .iter()
-            .find(|(_, (e_client, e_id))| e_client == &client && e_id == &id)
+            .find(|(_, (e_client, e_id))| e_client == &client && e_id == id)
             .map(|(rid, _)| rid)
     }
 }
