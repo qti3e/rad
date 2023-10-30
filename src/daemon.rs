@@ -100,7 +100,7 @@ async fn handle_client(id: ClientId, tx: mpsc::Sender<Task>, stream: UnixStream)
         let message: lsp_server::Message =
             serde_json::from_slice(&bytes).context("Invalid LSP message.")?;
 
-        if matches!(&message, lsp_server::Message::Request(req) if req.method == "shutdown") {
+        if matches!(&message, lsp_server::Message::Notification(not) if not.method == "exit") {
             break;
         }
 

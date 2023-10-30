@@ -324,12 +324,19 @@ impl GlobalState {
     ) -> Result<()> {
         info!("Client request: {}", req.method);
 
-        // These two should have already been handled as `handle_client_drop` by
-        // the caller. They should never reach this far.
-        assert_ne!(req.method, "shutdown");
-        assert_ne!(req.method, "exit");
-
         let client = self.client.get_mut(&id).context("Client not found.")?;
+
+        if req.method == "shutdown" {
+            client
+                .write_message(&lsp_server::Response {
+                    id: req.id,
+                    result: Some(serde_json::Value::Null),
+                    error: None,
+                })
+                .await;
+            return Ok(());
+        }
+
         let server = self.server.get_mut(&client.server_id).unwrap();
         server.send_request(id, req).await;
 
@@ -396,6 +403,10 @@ impl GlobalState {
         id: ClientId,
         not: lsp_server::Notification,
     ) -> Result<()> {
+        // This should have already been handled as `handle_client_drop` by
+        // the caller. This should never reach this far.
+        assert_ne!(not.method, "exit");
+
         let result = self.handle_client_notification_inner(id, not).await;
 
         if result.is_err() {
