@@ -3,17 +3,15 @@
 //! this project.
 
 // TODO:
-// Document management
-// Client drop - x
-// Server drop - x
+// Document management : can be improved.
 // Server garbage collection
 // Window progress bar
-// Switching primary
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
 use fxhash::{FxHashMap, FxHashSet};
+use lsp_types::notification::Notification;
 use serde::{Deserialize, Serialize};
 use std::{
     process::Stdio,
@@ -126,6 +124,19 @@ struct ServerState {
     /// registration is only stored when we get a confirmation from the first primary connection
     /// that we sent this request to.
     registered_capabilities: Vec<lsp_types::Registration>,
+    /// The open documents by the current clients. Currently, one limitation we have is the fact
+    /// that we support only one client on each document right now. But this can be improved to
+    /// support more than that.
+    document: FxHashMap<lsp_types::Url, OpenDocument>,
+}
+
+struct OpenDocument {
+    /// The current client that has ownership over this text document.
+    opened_by: ClientId,
+    /// The is_modified flag determines if the content is changed without
+    /// being stored on the disk. We reject new connections if that's the
+    /// case.
+    is_modified: bool,
 }
 
 #[derive(Debug)]
@@ -282,6 +293,7 @@ impl GlobalState {
             request_id_map: FxHashMap::default(),
             pending_server_requests: FxHashMap::default(),
             registered_capabilities: Vec::new(),
+            document: FxHashMap::default(),
         };
 
         // We can send the 'initialize' request to the server.
@@ -378,8 +390,22 @@ impl GlobalState {
         Ok(())
     }
 
-    // WIP
     pub async fn handle_client_notification(
+        &mut self,
+        id: ClientId,
+        not: lsp_server::Notification,
+    ) -> Result<()> {
+        let result = self.handle_client_notification_inner(id, not).await;
+
+        if result.is_err() {
+            let _ = self.handle_client_drop(id).await;
+        }
+
+        result
+    }
+
+    // WIP
+    async fn handle_client_notification_inner(
         &mut self,
         id: ClientId,
         mut not: lsp_server::Notification,
@@ -401,7 +427,8 @@ impl GlobalState {
                     .await;
             }
 
-            // If this is the only connection it means it is a new primary.
+            // If connection is 'primary' during this stage, it is a new primary
+            // which we should process.
             if is_primary {
                 let server_id = client.server_id;
                 self.new_primary(server_id).await;
@@ -416,26 +443,86 @@ impl GlobalState {
             return Ok(());
         }
 
-        // TODO: Document ownership.
+        if let Some(params) =
+            parse_notification::<lsp_types::notification::DidOpenTextDocument>(&not)?
+        {
+            if server.document.contains_key(&params.text_document.uri) {
+                bail!("Document is already open by another client.");
+            }
 
-        if not.method == "textDocument/didOpen" {
-            error!("{not:#?}");
+            server.document.insert(
+                params.text_document.uri,
+                OpenDocument {
+                    opened_by: id,
+                    is_modified: false,
+                },
+            );
         }
 
-        if not.method == "textDocument/didChange" {
-            error!("{not:#?}");
+        if let Some(params) =
+            parse_notification::<lsp_types::notification::DidChangeTextDocument>(&not)?
+        {
+            let doc = server
+                .document
+                .get_mut(&params.text_document.uri)
+                .with_context(|| format!("Text document not open: {}", params.text_document.uri))?;
+
+            if doc.opened_by != id {
+                bail!("Text document not owned by the client.");
+            }
+
+            doc.is_modified = true;
         }
 
-        if not.method == "textDocument/didClose" {
-            error!("{not:#?}");
+        if let Some(params) =
+            parse_notification::<lsp_types::notification::DidCloseTextDocument>(&not)?
+        {
+            let doc = server
+                .document
+                .get_mut(&params.text_document.uri)
+                .with_context(|| format!("Text document not open: {}", params.text_document.uri))?;
+
+            if doc.opened_by != id {
+                bail!("Text document not owned by the client.");
+            }
+
+            server.document.remove(&params.text_document.uri);
         }
 
-        if not.method == "textDocument/didSave" {
-            error!("{not:#?}");
+        if let Some(params) =
+            parse_notification::<lsp_types::notification::DidSaveTextDocument>(&not)?
+        {
+            let doc = server
+                .document
+                .get_mut(&params.text_document.uri)
+                .with_context(|| format!("Text document not open: {}", params.text_document.uri))?;
+
+            if doc.opened_by != id {
+                bail!("Text document not owned by the client.");
+            }
+
+            doc.is_modified = false;
         }
 
-        if not.method == "workspace/didRenameFiles" {
-            error!("{not:#?}");
+        if let Some(params) = parse_notification::<lsp_types::notification::DidRenameFiles>(&not)? {
+            for rename in params.files {
+                let old_uri = lsp_types::Url::parse(&rename.old_uri)
+                    .context("Failed to parse document URI")?;
+                let new_uri = lsp_types::Url::parse(&rename.new_uri)
+                    .context("Failed to parse document URI")?;
+
+                let doc = server
+                    .document
+                    .get_mut(&old_uri)
+                    .with_context(|| format!("Text document not open: {}", old_uri))?;
+
+                if doc.opened_by != id {
+                    bail!("Text document not owned by the client.");
+                }
+
+                let doc = server.document.remove(&old_uri).unwrap();
+                server.document.insert(new_uri, doc);
+            }
         }
 
         if not.method == "$/cancelRequest" {
@@ -616,10 +703,35 @@ impl GlobalState {
     pub async fn handle_client_drop(&mut self, id: ClientId) -> Result<()> {
         info!("Client dropping");
 
-        let client = self.client.get_mut(&id).context("Client not found.")?;
+        let client = self.client.remove(&id).context("Client not found.")?;
         let server_id = client.server_id;
         let server = self.server.get_mut(&server_id).unwrap();
         let maybe_index = server.connections.iter().position(|v| *v == id);
+
+        let docs_to_close = server
+            .document
+            .iter()
+            .filter_map(|(uri, doc)| (doc.opened_by == id).then_some(uri))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for uri in docs_to_close {
+            info!("Sending 'didClose' on behalf of the client.");
+
+            server.document.remove(&uri);
+
+            server
+                .write_message(lsp_server::Message::Notification(
+                    lsp_server::Notification {
+                        method: lsp_types::notification::DidCloseTextDocument::METHOD.to_string(),
+                        params: serde_json::to_value(lsp_types::DidCloseTextDocumentParams {
+                            text_document: lsp_types::TextDocumentIdentifier { uri },
+                        })
+                        .unwrap(),
+                    },
+                ))
+                .await;
+        }
 
         // This can be none when the client gets disconnected before it sends the 'initialized'
         // notification.
@@ -633,8 +745,6 @@ impl GlobalState {
                 self.new_primary(server_id).await;
             }
         }
-
-        // TODO: Close the documents that were open by this client.
 
         Ok(())
     }
@@ -871,4 +981,18 @@ fn extract_server_info(
 fn hijack_initialize_params(params: lsp_types::InitializeParams) -> lsp_types::InitializeParams {
     // TODO: enable work_done_progress.
     params
+}
+
+#[inline(always)]
+fn parse_notification<N: lsp_types::notification::Notification>(
+    notification: &lsp_server::Notification,
+) -> Result<Option<N::Params>> {
+    if notification.method != N::METHOD {
+        return Ok(None);
+    }
+
+    let params = serde_json::from_value(notification.params.clone())
+        .with_context(|| format!("Failed to parse parameters for '{}'", N::METHOD))?;
+
+    Ok(Some(params))
 }
