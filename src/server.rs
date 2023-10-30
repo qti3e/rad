@@ -4,8 +4,8 @@
 
 // TODO:
 // Document management
-// Client drop
-// Server drop
+// Client drop - x
+// Server drop - x
 // Server garbage collection
 // Window progress bar
 // Switching primary
@@ -56,7 +56,8 @@ struct ClientState {
     is_initialized: bool,
     /// The request id that the client used to send the 'initialize' request.
     initialize_request_id: lsp_server::RequestId,
-    /// The information that we cared about from the `initialize` request send by this client.
+    /// The information that we cared about extracted from the `initialize` request sent by this
+    /// client.
     info: ClientLspInfo,
     /// The next request id that we can use when sending an out going request.
     next_request_id: i32,
@@ -71,7 +72,7 @@ struct ClientState {
 }
 
 /// Implements [`From<lsp_types::InitializeParams>`] and can let us track the info we care
-/// about which we can gather from that.
+/// about which we can gather from that, mostly about client's capabilities.
 struct ClientLspInfo {
     work_done_progress: bool,
 }
@@ -327,7 +328,7 @@ impl GlobalState {
         Ok(())
     }
 
-    // WIP
+    // DONE
     pub async fn handle_client_response(
         &mut self,
         id: ClientId,
@@ -473,12 +474,24 @@ impl GlobalState {
 
         let server = self.server.get_mut(&id).context("Server not found.")?;
 
-        if req.method == "window/workDoneProgress/create" {
-            //
-        }
+        if req.method.starts_with("window/workDoneProgress/") {
+            if req.method == "window/workDoneProgress/create" {
+                // TODO: Notify the clients.
+            }
 
-        if req.method == "window/workDoneProgress/cancel" {
-            //
+            if req.method == "window/workDoneProgress/cancel" {
+                // TODO: Notify the clients.
+            }
+
+            server
+                .write_message(lsp_server::Message::Response(lsp_server::Response {
+                    id: req.id,
+                    result: Some(serde_json::Value::Null),
+                    error: None,
+                }))
+                .await;
+
+            return Ok(());
         }
 
         if let Some(client_id) = server.connections.get(0) {
@@ -578,6 +591,8 @@ impl GlobalState {
         id: ServerId,
         not: lsp_server::Notification,
     ) -> Result<()> {
+        let server = self.server.get_mut(&id).context("Server not found.")?;
+
         if not.method == "$/progress" {
             let params: lsp_types::ProgressParams =
                 serde_json::from_value(not.params).context("Could not parse server message")?;
@@ -586,26 +601,89 @@ impl GlobalState {
         }
 
         if not.method == "experimental/serverStatus" {
-            // TODO
-            return Ok(());
+            info!("Server is healthy!");
         }
 
-        bail!("Server-notif {not:#?}")
+        // Broadcast every notification to all of the clients.
+        for client_id in &server.connections {
+            let client = self.client.get_mut(client_id).unwrap();
+            client.write_message(&not).await;
+        }
+
+        Ok(())
     }
 
     pub async fn handle_client_drop(&mut self, id: ClientId) -> Result<()> {
-        bail!("todo: client drop")
+        info!("Client dropping");
+
+        let client = self.client.get_mut(&id).context("Client not found.")?;
+        let server_id = client.server_id;
+        let server = self.server.get_mut(&server_id).unwrap();
+        let maybe_index = server.connections.iter().position(|v| *v == id);
+
+        // This can be none when the client gets disconnected before it sends the 'initialized'
+        // notification.
+        if let Some(index) = maybe_index {
+            server.connections.remove(index);
+
+            if index == 0 && !server.connections.is_empty() {
+                // The index is zero which means this is the oldest client that was connected and
+                // now that we have removed it a new client is taking the role of the primary so
+                // we have to make the switch.
+                self.new_primary(server_id).await;
+            }
+        }
+
+        // TODO: Close the documents that were open by this client.
+
+        Ok(())
     }
 
     pub async fn handle_server_drop(&mut self, id: ServerId) -> Result<()> {
-        bail!("todo")
+        info!("Server dropping");
+        if self.server.contains_key(&id) {
+            self.drop_server(id).await;
+        }
+        Ok(())
     }
 
     async fn drop_server(&mut self, id: ServerId) {
-        // TODO
+        let mut server = self.server.remove(&id).expect("The server to exists.");
+        let clients = self
+            .client
+            .iter()
+            .filter_map(|(cid, client)| (client.server_id == id).then_some(*cid))
+            .collect::<Vec<_>>();
+
+        for cid in clients {
+            self.client.remove(&cid);
+        }
+
+        server.kill_sender.send(server.stdin);
     }
 
-    async fn new_primary(&mut self, id: ServerId) {}
+    async fn new_primary(&mut self, id: ServerId) {
+        // We have a new primary connection on the provided server. We have a few obligations:
+        // 1. Send the workspace configuration of this client to the server.
+        // 2. Send every pending server request to the new primary.
+
+        let server = self.server.get_mut(&id).expect("The server to exists.");
+        let client_id = server.connections[0];
+        let client = self
+            .client
+            .get_mut(&client_id)
+            .expect("The client to exists");
+
+        if let Some(not) = client.last_change_configuration_notification.take() {
+            server
+                .write_message(lsp_server::Message::Notification(not))
+                .await;
+        }
+
+        for (_, req) in &server.pending_server_requests {
+            client.send_request(req.clone()).await;
+        }
+    }
 }
 
 impl ServerState {
