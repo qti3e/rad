@@ -6,7 +6,7 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
-use tracing::{error, info, trace};
+use tracing::{error, info};
 
 use crate::{
     server::{ClientId, GlobalState, NewConnection, Task},

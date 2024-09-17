@@ -1,9 +1,7 @@
-use anyhow::Result;
 use std::{collections::HashMap, env, path::PathBuf};
 
 use resolve_path::PathResolveExt;
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 use triomphe::Arc;
 
 /// The configuration values.

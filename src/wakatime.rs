@@ -1,4 +1,3 @@
-use std::borrow::Borrow;
 use tokio::process::Command;
 
 /// Implemented over any lsp message that can be reported to wakatime.

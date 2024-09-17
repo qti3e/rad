@@ -8,8 +8,7 @@
 // Window progress bar
 // Better logs (Terminal UI)
 
-use anyhow::{anyhow, bail, Context, Result};
-use bytes::BytesMut;
+use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
 use fxhash::{FxHashMap, FxHashSet};
 use lsp_types::notification::Notification;
@@ -18,18 +17,18 @@ use std::{
     process::Stdio,
     sync::atomic::{AtomicU32, Ordering},
 };
-use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+use tokio_util::codec::{FramedWrite, LengthDelimitedCodec};
 use tracing::{error, info};
 
 use tokio::{
     io::{AsyncWriteExt, BufReader},
-    net::{unix::OwnedWriteHalf, UnixListener, UnixStream},
-    process::{Child, ChildStdin, Command},
+    net::unix::OwnedWriteHalf,
+    process::{ChildStdin, Command},
     sync::{mpsc, oneshot},
 };
 
 use crate::{
-    types::{BootstrapMessage, Config, SessionKey},
+    types::{BootstrapMessage, Config},
     utils::{encode_lsp_message, find_project_root, read_lsp_message},
     wakatime::WakaTimeReport,
 };
@@ -694,7 +693,7 @@ impl GlobalState {
                 client_state.write_message(&res).await;
             }
 
-            let mut err_message: &str;
+            let err_message: &str;
 
             if let Some(e) = &res.error {
                 err_message = &e.message;
@@ -845,7 +844,7 @@ impl GlobalState {
     }
 
     async fn drop_server(&mut self, id: ServerId) {
-        let mut server = self.server.remove(&id).expect("The server to exists.");
+        let server = self.server.remove(&id).expect("The server to exists.");
 
         let descriptor = self
             .server_descriptors
