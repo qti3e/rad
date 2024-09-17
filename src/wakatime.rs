@@ -17,7 +17,8 @@ pub trait WakaTimeReport {
     fn report_wakatime(&self, cli: &str, user_agent: &str, project_root: &str) {
         let mut cmd = Command::new(cli);
         cmd.args(["--plugin", user_agent]);
-        cmd.args(["--project", project_root]);
+        cmd.args(["--alternate-project", project_root]);
+        cmd.args(["--project-folder", project_root]);
         cmd.args(["--language", "rust"]);
         cmd.args(["--category", "coding"]);
 
@@ -59,6 +60,11 @@ impl WakaTimeReport for lsp_types::DidChangeTextDocumentParams {
         {
             cmd.args(["--lineno", &line.to_string()]);
         }
+
+        // TODO(qti3e): Once we have editor support.
+        // "--line-additions", "123",
+        // "--line-deletions", "456",
+
         cmd.arg("--write");
     }
 }
