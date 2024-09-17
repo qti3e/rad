@@ -31,7 +31,12 @@ use tokio::{
 use crate::{
     types::{BootstrapMessage, Config, SessionKey},
     utils::{encode_lsp_message, find_project_root, read_lsp_message},
+    wakatime::WakaTimeReport,
 };
+
+// Wakatime plugin agent.
+const WAKATIME_PLUGIN_USER_AGENT: &str =
+    concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 /// The writer we use to send stuff to the client. Maybe later we can make this some
 /// sort of generic and support a non-UDS communication to the client.
@@ -68,6 +73,9 @@ struct ClientState {
     /// Instead we keep it here so that we can send it to the server once this connection becomes
     /// primary.
     last_change_configuration_notification: Option<lsp_server::Notification>,
+    /// The cache of the user agenet string we created during the initialization this contains
+    /// the editor name and such.
+    wakatime_user_agent: String,
 }
 
 /// Implements [`From<lsp_types::InitializeParams>`] and can let us track the info we care
@@ -129,6 +137,8 @@ struct ServerState {
     /// that we support only one client on each document right now. But this can be improved to
     /// support more than that.
     document: FxHashMap<lsp_types::Url, OpenDocument>,
+    /// The workspace root extracted from the [ServerDescriptor::workspace].
+    workspace_root: String,
 }
 
 struct OpenDocument {
@@ -233,6 +243,28 @@ impl GlobalState {
             .map(|sid| (true, *sid))
             .unwrap_or_else(|| (false, ServerId::new()));
 
+        let wakatime_user_agent = if let Some(info) = &params.client_info {
+            format!(
+                "{}/{} {} {}-wakatime/{}",
+                // Editor part
+                info.name,
+                info.version
+                    .as_ref()
+                    .map_or_else(|| "unknown", |version| version),
+                // Plugin part
+                WAKATIME_PLUGIN_USER_AGENT,
+                // Last part is the one parsed by `wakatime` servers
+                // It follows `{editor}-wakatime/{version}` where `editor` is
+                // registered in intern. Works when `info.name` matches what the
+                // wakatime dev choose.
+                // IDEA: rely less on luck
+                info.name,
+                env!("CARGO_PKG_VERSION"),
+            )
+        } else {
+            WAKATIME_PLUGIN_USER_AGENT.into()
+        };
+
         // Create the empty client state struct but we only insert it in a tailing block of code in
         // the cfg to ensure consistency.
         let client_state = ClientState {
@@ -244,6 +276,7 @@ impl GlobalState {
             next_request_id: 0,
             request_id_map: FxHashMap::default(),
             last_change_configuration_notification: None,
+            wakatime_user_agent,
         };
 
         if existed {
@@ -260,7 +293,7 @@ impl GlobalState {
             if let Some(result) = &server_state.initialize_result {
                 let message = lsp_server::Message::Response(lsp_server::Response {
                     id: req_id,
-                    result: Some(serde_json::to_value(&result).unwrap()),
+                    result: Some(serde_json::to_value(result).unwrap()),
                     error: None,
                 });
 
@@ -294,6 +327,7 @@ impl GlobalState {
             pending_server_requests: FxHashMap::default(),
             registered_capabilities: Vec::new(),
             document: FxHashMap::default(),
+            workspace_root: server_descriptor.workspace.clone(),
         };
 
         // We can send the 'initialize' request to the server.
@@ -426,7 +460,7 @@ impl GlobalState {
 
         let client = self.client.get_mut(&id).context("Client not found.")?;
         let server = self.server.get_mut(&client.server_id).unwrap();
-        let is_primary = server.connections.len() == 0 || server.connections[0] == id;
+        let is_primary = server.connections.is_empty() || server.connections[0] == id;
 
         if not.method == "initialized" {
             client.is_initialized = true;
@@ -458,6 +492,12 @@ impl GlobalState {
         if let Some(params) =
             parse_notification::<lsp_types::notification::DidOpenTextDocument>(&not)?
         {
+            params.maybe_report_wakatime(
+                &self.config.wakatime_cli,
+                &client.wakatime_user_agent,
+                &server.workspace_root,
+            );
+
             if server.document.contains_key(&params.text_document.uri) {
                 bail!("Document is already open by another client.");
             }
@@ -474,6 +514,12 @@ impl GlobalState {
         if let Some(params) =
             parse_notification::<lsp_types::notification::DidChangeTextDocument>(&not)?
         {
+            params.maybe_report_wakatime(
+                &self.config.wakatime_cli,
+                &client.wakatime_user_agent,
+                &server.workspace_root,
+            );
+
             let doc = server
                 .document
                 .get_mut(&params.text_document.uri)
@@ -489,6 +535,12 @@ impl GlobalState {
         if let Some(params) =
             parse_notification::<lsp_types::notification::DidCloseTextDocument>(&not)?
         {
+            params.maybe_report_wakatime(
+                &self.config.wakatime_cli,
+                &client.wakatime_user_agent,
+                &server.workspace_root,
+            );
+
             let doc = server
                 .document
                 .get_mut(&params.text_document.uri)
@@ -599,7 +651,7 @@ impl GlobalState {
             return Ok(());
         }
 
-        if let Some(client_id) = server.connections.get(0) {
+        if let Some(client_id) = server.connections.first() {
             server.pending_server_requests.insert(req.id.clone(), req);
             let client = self.client.get_mut(client_id).unwrap();
         } else {
@@ -834,7 +886,7 @@ impl GlobalState {
                 .await;
         }
 
-        for (_, req) in &server.pending_server_requests {
+        for req in server.pending_server_requests.values() {
             client.send_request(req.clone()).await;
         }
     }
@@ -886,6 +938,7 @@ impl ClientState {
     }
 }
 
+#[allow(clippy::new_without_default)]
 impl ClientId {
     pub fn new() -> Self {
         static CLIENT_ID: AtomicU32 = AtomicU32::new(0);
@@ -893,6 +946,7 @@ impl ClientId {
     }
 }
 
+#[allow(clippy::new_without_default)]
 impl ServerId {
     pub fn new() -> Self {
         static SERVER_ID: AtomicU32 = AtomicU32::new(0);
@@ -906,8 +960,7 @@ impl From<&lsp_types::InitializeParams> for ClientLspInfo {
             .capabilities
             .window
             .as_ref()
-            .map(|window| window.work_done_progress)
-            .flatten()
+            .and_then(|window| window.work_done_progress)
             .unwrap_or(false);
 
         Self { work_done_progress }
@@ -987,7 +1040,7 @@ fn extract_server_info(
         .cloned()
         .or(params.root_uri.clone().map(|uri| uri.to_string()))
         .or(params.root_path.clone())
-        .map(|v| Ok::<_, anyhow::Error>(v))
+        .map(Ok::<_, anyhow::Error>)
         .unwrap_or_else(|| {
             find_project_root(&bootstrap.cwd).map(|v| v.to_string_lossy().to_string())
         })

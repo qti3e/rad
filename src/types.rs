@@ -13,6 +13,8 @@ pub struct Config {
     pub socket_path: PathBuf,
     /// The rust analyzer binary.
     pub rust_analyzer_bin: String,
+    /// The name of the wakatime-cli binary to use.
+    pub wakatime_cli: Option<String>,
 }
 
 impl Default for Config {
@@ -24,10 +26,18 @@ impl Default for Config {
             .to_path_buf();
 
         let rust_analyzer_bin = env::var("RAD_RA").unwrap_or_else(|_| "rust-analyzer".to_string());
+        let wakatime_cli = env::var("RAD_WAKATIME").ok().map(|s| {
+            if s.is_empty() {
+                "wakatime-cli".into()
+            } else {
+                s
+            }
+        });
 
         Self {
             socket_path,
             rust_analyzer_bin,
+            wakatime_cli,
         }
     }
 }
